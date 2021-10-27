@@ -1,0 +1,1438 @@
+---
+title: "Group testing algorithms"
+author: "Antoine Bonnet"
+date: "24/08/2021"
+output: html_document
+bibliography: references.bib 
+link_citations: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)    # Plots
+library(ggrepel)    # Labeled plots
+library(plotly)     # 3D Surfaces
+library(simsalapar) # Simulations
+library(abind)      # Slicing hypercube
+library(fmsb)       # Radar chart
+library(forecast)   # Time series prediction
+library(MASS)       # Distribution estimation
+```
+
+# Group testing
+
+The goal of group testing is to efficiently identify infected patients within a sample using pooled tests. Its fundamental assumption is that we are able to combine several biological samples together and conduct a test on the pooled sample. If the test is negative, then none of the test subjects are infected. On the other hand, if the test is positive, then at least one of the subjects is infected.
+
+Group-testing algorithms can be **adaptive**, **semi-adaptive** or **non-adaptive**. Non-adaptive algorithms use a single round of pre-determined pooled tests to infer the state of each patient in the sample. By contrast, adaptive algorithms use several rounds of pooled tests, which are sequentially chosen depending on the test results of previous rounds. Finally, semi-adaptive algorithms typically use a first round of parallel pooled tests to narrow down the set of potentially infected patients, which are then tested individually.
+
+To simulate each algorithm, we randomly generate a **patient vector** $x=(x_1,\ldots, x_n)$ of size $n$ where the $i$th coordinate $x_i$ is $1$ if patient $i$ is infected and $0$ otherwise.
+
+Assuming that the probabilities of infection are independent within the sample, the **prevalence rate** $p$ of the disease corresponds to the probability that each patient $i$ is infected. The goal of any testing algorithm is to infer the value of the unknown patient vector $x$, by generating a **diagnostic vector** $\hat{x}=(\hat{x}_1,\ldots, \hat{x}_n)$, where the $i$th coordinate $\hat{x}_i$ is $1$ if patient $i$ is labeled as infected by the algorithm and $0$ otherwise. The **accuracy** of the algorithm can be computed by comparing the patient vector $x$ and the diagnostic vector $\hat{x}$. At the end of the simulation, we obtain the number of tests performed, the number of rounds spent as well as the accuracy of the final diagnostic.
+
+The **naive approach** consists in testing every patient individually. Although it is the most commonly used procedure, we will see that its inefficiency in terms of number of tests makes its use sub-optimal, especially when the prevalence is low. Individual testing will serve as a basis of comparison for other algorithms covered in the following sections. We define the **relative cost** of a group-testing algorithm as the ratio of the number of tests performed by the algorithm over the sample size $n$ (which corresponds to the number of tests performed in the naive approach). We similarly define the **relative time** of an algorithm as the average number of rounds required for the diagnostic of each patient in the sample.
+
+## Sensitivity and specificity
+
+In practice, screening tests may produce falsified results. We denote by $q$ the **sensitivity** (or **true positive rate**) of the test, which is the probability that an infected sample tests positive. Similarly, we denote by $r$ the **specificity** (or **true negative rate**), which is the probability that a healthy sample tests negative.
+
+Similarly, the true positive rate of an algorithm is the proportion of infected patients who are correctly identified as such. Its value is given by $TPR=1-FN/P$, where $FN$ is the number of false negative errors (undetected infected subjects) in the estimate $\hat{x}$ and $P$ is the number of infected individuals in $x$. On the other hand, the true negative rate of an algorithm is the proportion of healthy patients who are correctly identified as such. Its value is given by $TNR=1-FP/N$, where $FP$ is the number of false positive errors (healthy subjects labeled as infected) in the estimate $\hat{x}$ and $N$ is the number of healthy individuals in $x$.
+
+In order to conduct realistic simulations of group-testing algorithms, we must estimate the sensitivity and specificity of COVID-19 rt-PCR tests using available data. Evidence suggests that increasing the pool size decreases the sensitivity $q$. Indeed, pooling may lead to the dilution of the infected biological material in the combined sample, thus increasing the false-negative rate and so decreasing the sensitivity $q$. To accurately reflect the effects of dilution on sensitivity, we will infer a relation of the sensitivity as a function of the number of patients in the pool for each infected individual. Reliable data also suggests that pooling has no impact on the specificity $r$; it is therefore reasonable to assume throughout our simulations that the sensitivity $r$ is fixed.
+
+We can give an estimate for the COVID-19 rt-PCR test specificity, as well as the sensitivity for individual testing. A study obtained the following data: "The sensitivity and specificity of the saliva samples were 84.2% (95% CI 60.4--96.6%), and 98.9% (95% CI 96.1--99.9%), respectively." [@SalivaSensitivity]. Another study found sensitivity data for pools with a single infected individuals and varying sizes. "By applying the regression coefficients (Ct increase) to the Ct values from all SARS-CoV-2--positive saliva samples detected during our studies (6), we estimate that pool sizes will lead to detection sensitivities of 92.59% (95% CI 88.89%--95.56%) for pools of 5 samples, 88.89% (95% CI 80.00%--91.85%) for pools of 10, and 85.19% (95% CI 75.56%--91.11%) for pools of 20, relative to sensitivity of unpooled samples." [@SalivaDilution].
+
+Note that these experiments conducted a first round of tests on pools with a single infected individual, and a second round of individual testing. The observed sensitivity coming from the discrepancy between the two rounds' results is therefore relative to the sensitivity of individual testing. If we assume that the test sensitivity on individual samples is $q(1)=0.842$, we can obtain the final observed value of the sensitivity for varying pool sizes. We plot a power function as a trend line over the data and obtain the sensitivity estimate.
+
+```{r}
+q.1 <- 0.842 # Sensitivity for individual testing
+r <- 0.989   # Specificity
+
+data1 <- data.frame(size=rep(1,100), sensitivity=rep(q.1,100),low=rep(q.1,100),high=rep(q.1,100))
+data2 <- data.frame(size=rep(c(5,10,20),c(23,23,31)), sensitivity=q.1*rep(c(0.9259,0.8889,0.8519),c(23,23,31)), low=q.1*rep(c(0.89,0.8000,0.7556),c(23,23,31)), high=q.1*rep(c(0.9556,0.9185,0.9111),c(23,23,31)))
+allData <- rbind(data1,data2)
+
+# Trend line for sensitivity as a function of pool size
+fit <- nls(sensitivity ~ w*size^z, start=list(w=1,z=-0.05), data=allData)
+w <- coef(fit)[[1]]
+z <- coef(fit)[[2]]
+q <- function(k) {if (k >= 0) {w*k^z}} 
+
+ggplot(allData, aes(x=size,y=sensitivity)) + geom_pointrange(aes(ymin=low,ymax=high,colour="Observed data")) + stat_smooth(method="nls", formula = y ~ w*x^z, method.args=list(start=list(w=1,z=-0.05)), se=FALSE,size=0.6,aes(colour="Trendline")) + ggtitle("RT-PCR test sensitivity for different pool sizes") + labs(colour = "Legend",y="Sensitivity",x="Pool size") + theme(plot.title=element_text(hjust=0.5)) + scale_color_manual("Data",values= c("blue","#FF6666")) + scale_x_continuous(breaks=seq(0,30,5))
+
+```
+
+We can conduct our simulations in two different settings. We will refer to the case of tests with perfect accuracy as the **noiseless setting**, while the case with the realistic sensitivity and specificity estimated above will be referred to as the **noisy setting**.
+
+## COVID-19 Simulation
+
+A concrete way of visualizing the benefits of group testing is simulating its use with real data. We will collect data related to COVID-19, including the daily prevalence rate and number of tests performed since the beginning of the pandemic.
+
+### Data collection
+
+In this section, we extract data on the COVID-19 pandemic in Canada from the 'Our World in Data' website [@CovidData]. We are particularly concerned with the daily ratio of positive tests over the total number of tests, because this ratio effectively corresponds to the prevalence rate of the disease in the tested sample.
+
+```{r}
+dataset <- read.csv(url("https://covid.ourworldindata.org/data/owid-covid-data.csv"))
+country <- subset(dataset, dataset["location"] == "Canada")
+country <- country[complete.cases(country[,c("new_tests","positive_rate")]),]
+```
+
+We can visualize the daily ratio of positive COVID-19 tests in Canada, as well as the daily number of tests, from the onset of the pandemic in March 2020 to the current day. As tests are mostly performed during weekdays, the daily number of tests varies cyclically. We will therefore use a smoothed version of the number of daily tests instead of the raw number of daily tests, as shown below.
+
+```{r}
+dailyRate <- data.frame(
+  date = as.Date(country["date"]$date),
+  prevalence = country["positive_rate"]$positive_rate
+)
+ggplot(dailyRate, aes(x=date, y=100*prevalence)) + geom_line(colour="blue") + ggtitle("Daily positive COVID-19 test rate in Canada") + labs(x="Date", y="Positive test rate (%)") + theme(plot.title=element_text(hjust=0.5)) + scale_y_continuous(breaks=seq(0,20,2))
+
+dailySmoothed <- data.frame(
+  date = as.Date(country["date"]$date),
+  tests = country["new_tests_smoothed"]$new_tests_smoothed
+)
+ggplot(dailySmoothed, aes(x=date, y=tests)) + geom_line(colour="blue") + ggtitle("Smoothed daily number of new COVID-19 tests in Canada") + labs(x="Date", y="Smoothed number of new tests") + theme(plot.title=element_text(hjust=0.5)) + scale_y_continuous(breaks=seq(0,200000,20000))
+
+```
+
+### Prevalence and sample size estimations
+
+The ratio of positive COVID-19 tests corresponds to the prevalence $p$ of the disease in the tested sample, and the number of tests represents the sample size $n$. As evidenced above, these values vary as a function of the time $t$. We respectively denote by $p(t)$ and $n(t)$ the prevalence and number of people to test at any given day $t$. At the end of each day $t$, the prevalence $p(t)$ is the ratio of positive tests over the total number of tests $n(t)$ carried out on that day.
+
+At the start of each day $t$, we wish to choose and apply the optimal group-testing procedure. This choice relies on the prevalence rate $p(t)$ and sample size $n(t)$, which are initially unknown as they vary from day to day. We must therefore obtain estimates of the prevalence $\hat{p}(t)$ and the sample size $\hat{n}(t)$ using data from previous days in order to guide that choice.
+
+Using the ARIMA model, we give an estimate of the current prevalence $\hat{p}(t)$ and sample size $\hat{n}(t)$ at any day $t$ using data from previous days. We visualize these predicted values and compare them to the actual values by measuring the discrepancy of our estimates $\hat{p}(t)$ and $\hat{n}(t)$ with the actual values $p(t)$ and $n(t)$.
+
+```{r}
+estimT <- fitted(auto.arima(x=dailySmoothed$tests))
+estimP <- fitted(auto.arima(x=dailyRate$prevalence))
+prediction <- data.frame(
+  date = dailySmoothed$date,
+  tests = dailySmoothed$tests,
+  estimT = estimT,
+  preval = dailyRate$prevalence,
+  estimP = estimP
+)
+
+ggplot(tail(prediction,-10)) + geom_line(aes(x=date,y=estimT,colour="Prediction")) + geom_line(aes(x=date,y=tests,colour="Observed data")) + ggtitle("Predicted daily number of new COVID-19 tests in Canada") + labs(colour = "Legend",y="Number of new tests",x="Date") + theme(plot.title=element_text(hjust=0.5)) + scale_y_continuous(breaks=seq(0,200000,20000)) + scale_color_manual("Data",values= c("blue","#FF6666"))
+
+ggplot(tail(prediction,-10)) + geom_line(aes(x=date,y=estimP,colour="Prediction")) + geom_line(aes(x=date,y=preval,colour="Observed data")) + ggtitle("Predicted daily positive COVID-19 test rate in Canada") + labs(colour = "Legend",y="Positive test rate",x="Date") + theme(plot.title=element_text(hjust=0.5)) + scale_y_continuous(breaks=seq(0,0.2,0.02)) + scale_color_manual("Data",values= c("blue","#FF6666"))
+
+expT <- dailySmoothed$tests
+expP <- dailyRate$prevalence
+error <- data.frame(
+  date = dailySmoothed$date,
+  errT = 100*abs(prediction$estimT - prediction$tests)/prediction$tests,
+  errP = 100*abs(prediction$estimP - prediction$preval)/prediction$preval
+)
+
+ggplot(tail(error,-10)) + geom_line(aes(x=date,y=errT,colour="Error")) + geom_line(aes(x=date,y=mean(errT),colour="Average error"),linetype="dashed") + ggtitle("Prediction error of daily number of new COVID-19 tests in Canada") + labs(colour = "Legend",y="Relative error (%)",x="Date") + theme(plot.title=element_text(hjust=0.5)) + scale_y_continuous(breaks=seq(0,24,2)) + scale_color_manual("Data", values=c("red","blue"))
+
+ggplot(tail(error,-10)) + geom_line(aes(x=date,y=errP,colour="Error")) + geom_line(aes(x=date,y=mean(errP),colour="Average error"),linetype="dashed") + ggtitle("Prediction error of daily positive COVID-19 test rate in Canada") + labs(colour = "Legend",y="Relative error (%)",x="Date") + theme(plot.title=element_text(hjust=0.5)) + scale_y_continuous(breaks=seq(0,30,5)) + scale_color_manual("Data", values=c("red","blue"))
+
+```
+
+The average relative error of the prevalence estimate is about $5\%$, while it is $2\%$ for the number of tests. These values are low enough to consider the ARIMA model as a reliable esimate for both of these values.
+
+We remark that the relative error in the predicted prevalence rate over the last year in Canada follows a normal distribution. From this distribution, we will be able to generate prevalence rate estimates with the same amount of accuracy as the ARIMA model. These prevalence estimates are used in a few non-adaptive algorithms.
+
+```{r}
+preval.err <- 100*(prediction$estimP-prediction$preval)/prediction$preval
+preval.param <- fitdistr(preval.err,"normal")$estimate
+
+# Function to generate a prevalence estimate
+prevalEstim <- function(p) {
+  relError <- rnorm(1,mean=preval.param[1],sd=preval.param[2])
+  p*(1+relError/100) 
+}
+  
+hist(preval.err,breaks=40,prob=TRUE,xlab="Error (%)",
+     main="Histogram of the error % in the predicted prevalence rate")
+
+curve(dnorm(x,mean=preval.param[1],sd=preval.param[2]),
+      col="darkblue",lwd=2,add=TRUE,yaxt="n")
+```
+
+## Naive approach
+
+As an example, we can construct a function that simulates the naive approach of individual testing on a sample $x \in \{0,1\}^n$ of $n$ individuals to obtain a number of tests $t=n$, a relative cost and relative time of $1$, as well as the true negative and positive rates resulting from the naive approach. In accordance with the law of large numbers, as we perform the naive approach on a sample of sufficiently large size $n$, the average true negative rate converges to $r = 98.9\%$ and the true positive rate converges to $q(1) = 84.2\%$.
+
+```{r}
+naive.test  <- function(x,q,r) {
+  n <- length(x)
+  # Generate false negative/positive results in each test
+  Tpos <- rbinom(n,1,q(1))
+  Tneg <- rbinom(n,1,r)
+  y <- x*Tpos + (1-x)*(1-Tneg)
+  FN <- sum((x-y)>0)
+  FP <- sum((x-y)<0)
+  if (sum(x) == 0) {TPR <- 1}
+  else {TPR <- 1-FN/(sum(x))}
+  if (sum(x) == n) {TNR <- 1}
+  else {TNR <- 1-FP/(sum(x==0))}
+  return(list(tests=n,cost=1,time=1,FN=FN,FP=FP,TNR=TNR,TPR=TPR))
+}
+
+n <- 100000  # Sample size
+p <- 0.1     # Prevalence
+x <- rbinom(n,1,p)
+naive <- naive.test(x,q,r)
+naive$TNR; naive$TPR
+
+```
+
+## Adaptive algorithms
+
+The main property of adaptive algorithms is that information is gathered *sequentially* about the state of the random sample $x$, and subsequent pools are chosen based on this information [@Review]. The adaptive algorithm can therefore make the best choice of pooled test depending on previous results so as to yield optimal cost-savings.
+
+However, the adaptive approach has two major drawbacks. First, the pooled tests at any given round depend on results of the previous round. As a rt-PCR test takes about 2 hours to complete, the amount of time required by adaptive algorithms may grow enough to render the procedure impractical. This is especially true for infected subjects as they are generally identified in the last round. Secondly, most adaptive algorithms do not inquire further on pools testing negative once, so they fall prey to the risk of false negatives, especially if pools of large size are used.
+
+In this section, we will cover two adaptive procedures: Dorfman's algorithm and the splitting algorithm.
+
+### Dorfman's algorithm
+
+The idea of group testing was introduced by Robert Dorfman in 1943 as a note in the Annals of Mathematical Statistics [@Dorfman]. At the time, Dorfman's goal was to find an efficient procedure to detect syphilitic soldiers in the U.S. army. He proposed a two-rounds adaptive procedure designed to detect infected individuals in a random sample. In the first round, the sample $x=(x_1,\ldots, x_n)$ of $n$ subjects is divided into pools of size $k$. We then perform a test on every pool. Depending on the results of this first round, we carry out additional tests in the second round. If a pooled test is negative, we label all subjects in the pool as healthy. On the other hand, if the pooled test is positive, we run individual tests on all subjects in the pool. We label these subjects according to the results of these individual tests. Given the prevalence $p$ of the disease among the random sample, the expected value of the number of tests performed is given by $$n\cdot\left(1+\dfrac{1}{k}-(1-p)^k\right).$$
+
+We construct a function that simulates Dorfman's procedure and computes the relative cost and time of the procedure, as well as the accuracy of the diagnostic for a given sample $x=(x_1,\ldots, x_n)$ with pool size $k$, sensitivity $q$ and specificity $r$.
+
+```{r}
+dorfman.test <- function(x,k,q,r){
+  # Generate false negatives/positives in individual tests
+  n <- length(x)
+  if (k >= n | k == 1) {
+    h <- naive.test(x,q,r)
+    return(list(tests=h$tests,cost=h$cost,time=h$time,TNR=h$TNR,TPR=h$TPR))
+  }
+  y <- rep(0,n)             # Diagnostic vector
+  sensi <- rbinom(n,1,q(1)) # Sensitivity for individual testing
+  speci <- rbinom(n,1,r)    # Specificity for individual testing
+  # Run a grouped test on each pool
+  pools <- ceiling(n/k)     # Number of pools
+  Tneg <- rbinom(pools,1,r) # True negative for pooled tests
+  times <- tests <- rep(1,pools)
+  for (i in 1:pools) {
+    idx <- (k*(i-1)+1):(k*i)
+    if (i == pools) {idx <- (k*(i-1)+1):n}
+    pool <- x[idx]
+    infected <- sum(pool)
+    # Generate false negatives/positives in pooled test
+    if (infected > 0) {
+      Tpos <- rbinom(1,1,q((k/infected)))
+      infected <- infected/infected*Tpos
+    }
+    else {infected <- 1-Tneg[i]}
+    # If pool test is positive, run individual tests on pool
+    if (infected > 0) {
+      y[idx] <- pool*sensi[idx] + (1-pool)*(1-speci[idx])
+      times[i] <- 2
+      tests[i] <- k+1
+    }
+  }
+  # Compute the overall performance
+  FN <- sum((x-y)>0)  # False negative errors
+  FP <- sum((x-y)<0)  # False positive errors
+  if (sum(x) == 0) {TPR <- 1}
+  else {TPR <- 1-FN/(sum(x))}
+  if (sum(x) == n) {TNR <- 1}
+  else {TNR <- 1-FP/(sum(x==0))}
+  tests <- sum(tests) # Total number of tests
+  time <- mean(times) # Average number of rounds
+  cost <- tests/n
+  return (list(tests=tests,cost=cost,time=time,TNR=TNR,TPR=TPR))
+}
+```
+
+#### Simulation
+
+Using the **simsalapar** package, we now construct a function that simulates Dorfman's algorithm over a large number $N$ of randomly-generated samples $x$ of size $n$ given the sensitivity $q$ and specificity $r$ for different values of the pool size $k$ and prevalence $p$.
+
+```{r}
+dorfman.sim <- function(N,n,q,r,size,preval) {
+  prevals <- length(preval)
+  if (prevals <= 1) {varP <- list(type="frozen",expr=quote(p),value=preval)}
+  else {varP <- list(type="grid", expr=quote(p), value=preval)}
+  varList <- varlist(
+    n.sim = list(type="N", expr=quote(N[sim]), value=N),
+    n = list(type="frozen", expr=quote(n), value=n),
+    q = list(type="frozen", expr=quote(q), value=q), 
+    r = list(type="frozen", expr=quote(r), value=r),
+    p = varP,
+    k = list(type="grid", expr=quote(k), value=size)
+    )
+  doOne <- function(n,k,p,q,r) {
+    x <- rbinom(n,1,p)                   # Generate sample
+    one <- dorfman.test(x,k,q,r)         # Perform algorithm
+    c(one$time,one$cost,one$TNR,one$TPR) # Output results
+  }
+  sim <- doLapply(varList, doOne=doOne, seed="seq")
+  getArray(sim)
+}
+
+```
+
+We can now simulate Dorfman's algorithm for different combinations of the pool size $k$ and prevalence rate $p$ ranging from $0.1\%$ to $20\%$ over samples of fixed size $n=1000$ in the noisy setting.
+
+```{r}
+N <- 30     # Number of simulations
+n <- 1000   # Fixed sample size
+size <- c(seq(1,25), seq(25,100,5)) # Pool Sizes
+p1 <- seq(0.001, 0.01, 0.002)
+p2 <- seq(0.01, 0.1, 0.005)
+p3 <- seq(0.1, 0.2, 0.01)
+preval <- c(p1,p2,p3) # Prevalences
+dorfmanArray <- dorfman.sim(N,n,q,r,size,preval)
+
+```
+
+#### Optimization
+
+Let us consider the realistic case where we would like to optimize the cost, time and accuracy of Dorfman's algorithm (or any other procedure). This means that, given a prevalence $p$ and a sample size $n$, we would like to find the pool size $k$ for which the number of rounds, the number of tests and the number of errors are simultaneously minimized. We respectively define the **time variable** $T(k)$ and **cost variable** $C(k)$ to be the relative cost and time of Dorfman's algorithm given a pool size $k$. We also define the **false negative rate variable** $N(k)$ and the **false positive rate variable** $P(k)$ to be the effective false negative and positive rates of Dorfman's algorithm for a pool size of $k$.
+
+The time-optimal pool size $k$ of Dorfman's algorithm is always $1$. This corresponds to the naive approach, which yields the worst average relative cost. We therefore cannot simultaneously optimize both the cost and the time of this algorithm. Therefore, our goal will be to minimize the weighted sum $w_TT(k)+w_CC(k)+w_NN(k)+w_PP(k)$, where $w_T,w_C,w_N$ and $w_P$ are respectively the weights given to minimizing the time, cost, false negative errors and false positive errors. Note that the values of the variables $T(k),C(k),N(k)$ and $P(k)$ are standardized, so as to produce an unbiased weighted sum.
+
+We construct another function that computes, from these simulation data, the weighted-optimal parameter of any group-testing algorithm (the pool size $K$ in the case of Dorfman's algorithm) given the values of the weights $w_T,w_C,w_n$ and $w_P$. The same function is used for any other algorithm by simply replacing the test function and the pool size $k$ with its corresponding parameter.
+
+```{r}
+standardize <- function(x) {
+  x[is.na(x) | is.nan(x)] <- mean(x[!is.na(x) & !is.nan(x)])
+  if (anyNA(x)) {NA}
+  if (min(x) == max(x)) {x}
+  else {(x-min(x))/(max(x)-min(x))}
+}
+
+algorithm.optimal <- function(simArray,parameters,preval,wT,wC,wN,wP) {
+  ps <- length(preval)
+  if (ps <= 1) {
+    avgs <- apply(simArray,1:2,mean)
+    avgTimes <- avgs[1,]
+    avgCosts <- avgs[2,]
+    avgTNR <- avgs[3,]
+    avgFNR <- 1-AvgTNR
+    avgTPR <- avgs[4,]
+    avgFPR <- 1-avgTPR
+    stdTimes <- standardize(avgTimes)
+    stdCosts <- standardize(avgCosts)
+    stdTNR <- standardize(avgFNR)
+    stdTPR <- standardize(avgFPR)
+    weightedAvgs <- wT*stdTimes + wC*stdCosts + wN*stdFNR + wP*stdFPR
+    optAvgs <- which.min(weightedAvgs)[[1]]
+    optParameters <- parameters[optAvgs]
+    optTimes <- avgTimes[[optAvgs]]
+    optCosts <- avgCosts[[optAvgs]]
+    optTNR <- avgTNR[[optAvgs]]
+    optTPR <- avgTPR[[optAvgs]]
+  }
+  else {
+    avgs <- apply(simArray,1:3,mean) 
+    avgTimes <- avgs[1,,]
+    avgCosts <- avgs[2,,]
+    avgTNR <- avgs[3,,]
+    avgFNR <- 1-avgTNR
+    avgTPR <- avgs[4,,]
+    avgFPR <- 1-avgTPR
+    stdTimes <- apply(avgTimes,1,standardize)
+    stdCosts <- apply(avgCosts,1,standardize)
+    stdFNR <- apply(avgFNR,1,standardize)
+    stdFPR <- apply(avgFPR,1,standardize)
+    weightedAvgs <- t(wT*stdTimes + wC*stdCosts + wN*stdFNR + wP*stdFPR)
+    optAvgs <- unlist(apply(weightedAvgs,1,which.min), use.names=FALSE)
+    optParameters <- parameters[optAvgs]
+    optTimes <- avgTimes[Pair(1:ps,optAvgs)]
+    optCosts <- avgCosts[Pair(1:ps,optAvgs)]
+    optTNR <- avgTNR[Pair(1:ps,optAvgs)]
+    optTPR <- avgTPR[Pair(1:ps,optAvgs)]
+  }
+  return(list(optParameters=optParameters,optCosts=optCosts,avgCosts=avgCosts,
+              optTimes=optTimes,avgTimes=avgTimes,optTNR=optTNR,
+              avgTNR=avgTNR,optTPR=optTPR,avgTPR=avgTPR))
+}
+
+
+```
+
+Using the above function, by setting the cost weight $w_C$ to $1$ and all other weights to $0$, we obtain the cost-optimal pool size $k$ of Dorfman's algorithm for sample size $n=1000$ and different values of the prevalence ranging from $0.01\%$ to $20\%$. We also infer from the data that the cost-optimal pool size $k_{opt}$ for Dorfman's algorithm as a function of the prevalence $p$ can be modeled using a power function trend line.
+
+```{r}
+wC <- 1     # Cost importance: We want cost-optimal!
+wN <- wT <- wP <- 0 
+dorfman <- algorithm.optimal(dorfmanArray,size,preval,wT,wC,wN,wP) 
+
+df <- data.frame(x=preval, y=dorfman$optParameters)
+fit <- nls(y ~ u*x^v, start = list(u=1,v=-0.5), data = df)
+summary(fit)
+ggplot(df,aes(x,y,colour="Simulation")) + geom_point() + stat_smooth(method="nls", formula = y ~ u*x^v, method.args=list(start=list(u=1,v=-0.5)), se=FALSE,size=0.6,aes(colour="Trendline")) + ggtitle("Cost-optimal pool size of Dorfman's algorithm\nn = 1000 (Noisy)") + labs(colour = "Legend",y="Cost-optimal pool size",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_x_continuous(breaks=seq(0, 0.2, 0.02)) + scale_color_manual("Data",values= c("blue","#FF6666")) + scale_y_continuous(breaks=seq(0,max(size),5))
+
+u <- coef(fit)[1]
+v <- coef(fit)[2]
+expectedCurve <- function(x) (1/(u*x^v)+1-(1-x)^(u*x^v))
+naiveCurve <- function(x) 1
+ggplot(data.frame(x=preval,y=dorfman$optCosts)) + geom_point(aes(x,y,colour="Simulation")) + geom_function(fun=naiveCurve, aes(x,y,colour="Naïve")) + geom_function(fun=expectedCurve, aes(x,y,colour="Expected")) + ggtitle("Optimal relative cost of Dorfman's algorithm\nn = 1000 (Noisy)") + labs(colour = "Legend",y="Optimal relative cost",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_color_manual("Data",values= c("#FF6666","gray","blue")) + scale_x_continuous(breaks=seq(0,0.2,0.05)) + scale_y_continuous(breaks=seq(0,1,0.2)) 
+
+
+```
+
+The cost-optimal pool size $k_{opt}$ of Dorfman's algorithm in the noisy setting for sample size $1000$ is approximated by $$k_{opt}(p) = 1.7p^{-0.438}.$$This means that the higher the prevalence, the smaller the cost-optimal pool size and the higher the associated cost.
+
+#### Analysis
+
+We visualize as a 3D surface the relative cost and time, as well as the true negative and positive rates of Dorfman's algorithm as a function of the pool size $k$ for a sample of size $n=1000$ and different values of the prevalence $p$ ranging from $0.1\%$ to $20\%$ in the noisy setting.
+
+```{r}
+Cost <- as.matrix(dorfman$avgCosts)
+plot_ly(z =~Cost,x=~size,y=~preval) %>% add_surface() %>% layout(
+  title="Relative cost of Dorfman's algorithm\nn = 1000 (Noisy)",
+  scene = list(
+    xaxis = list(title="Pool size"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "Relative cost")
+  )
+)
+
+Time <- as.matrix(dorfman$avgTimes)
+plot_ly(z =~Time,x=~size,y=~preval) %>% add_surface() %>% layout(
+  title="Relative time of Dorfman's algorithm\nn = 1000 (Noisy)",
+  scene = list(
+    xaxis = list(title="Pool size"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "Number of rounds")
+  )
+)
+
+TNR <- as.matrix(dorfman$avgTNR)/r
+plot_ly(z =~TNR,x=~size,y=~preval) %>% add_surface() %>% layout(
+  title="Relative true negative rate of Dorfman's algorithm\nn = 1000 (Noisy)",
+  scene = list(
+    xaxis = list(title="Pool size"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "True negative rate")
+  )
+)
+
+TPR <- as.matrix(dorfman$avgTPR)/q(1)
+plot_ly(z =~TPR,x=~size,y=~preval) %>% add_surface() %>% layout(
+  title="True positive rate of Dorfman's algorithm\nn = 1000 (Noisy)",
+  scene = list(
+    xaxis = list(title="Pool size"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "True positive rate")
+  )
+)
+
+```
+
+These surfaces underscore the properties of Dorfman's algorithm in the noisy setting. This procedure leads to significant cost savings, especially at low prevalence, if the pool size $k$ is chosen accordingly. The increase in the average time is relatively small with regards to the naive approach, meaning that this procedure may be practical enough to be used. Moreover, fewer healthy subjects are misdiagnosed as infected than with the naive approach, as patients need to be tested positive twice to be labeled as infected.
+
+The major drawback of this method is the considerable decrease in the true positive rate. Indeed, there is an increase of at least $20\%$ false negatives when compared with the naive approach, even for low pool sizes. The loss of sensitivity resulting from Dorfman's approach is a clear flaw, but it may be counteracted by the increased volume of patients, thus making it a viable approach in the context of mass screening.
+
+### Splitting algorithm
+
+The generalized binary splitting algorithm (or more simply the splitting algorithm) is an adaptive procedure consisting of multiple rounds [@Splitting]. At every round, we divide the sample into $d≥2$ pools of equal size. We then perform a grouped test on every pool. If a pooled test is negative, we label all individuals in the pool as healthy. On the other hand, if a pooled test is positive, we recursively apply the splitting algorithm on that pool by dividing the pool in $d$ sub-pools. This recursion occurs until we reach individual tests, at which point the infected people are identified. Clearly, the maximal number of rounds of the splitting algorithm is $(log_dn+1)$. In the case where $d=2$, this procedure is also called the binary splitting algorithm.
+
+We construct a recursive function that simulates the splitting algorithm and computes the relative cost and time of the procedure, as well as the accuracy of the diagnostic for a given sample $x=(x_1,\ldots, x_n)$ of size $n$ with $d$ splits, sensitivity $q$ and specificity $r$.
+
+```{r}
+splitting.test  <- function(x,d,q,r) {
+  n <- length(x)
+  h <- splitting.help(x,d,q,r)
+  if (sum(x) == 0) {TPR <- 1}
+  else {TPR <- 1-h$FN/(sum(x))}
+  if (sum(x) == n) {TNR <- 1}
+  else {TNR <- 1-h$FP/(sum(x==0))}
+  return(list(tests=h$tests,cost=h$tests/n,time=h$time/n,TNR=TNR,TPR=TPR))
+}
+
+splitting.help <- function(x,d,q,r) {
+  n <- length(x)
+  if (d <= 1 | n <= d) {return(naive.test(x,q,r))}
+  tests <- d
+  time <- n
+  FP <- 0
+  FN <- 0
+  # Splits the sample into d pools
+  pools <- split(x, cut(seq_along(x), d, labels=FALSE))
+  Tneg <- rbinom(d,1,r)
+  for (t in 1:d) {
+    pool <- unlist(pools[t],use.names=FALSE)
+    infected <- sum(pool)
+    # Generate false negatives/positives in pooled test
+    if (infected == 0) {infected <- 1-Tneg[t]}
+    else {
+      dilution <- length(pool)/infected
+      Tpos <- rbinom(1,1,q(dilution))
+      infected <- infected/infected*Tpos
+    }
+    # If pool test positive, recursively split the pool
+    if (infected == 0) {FN <- FN + sum(pool)}
+    else {
+      rec <- splitting.help(pool,d,q,r)
+      tests <- tests + rec$tests
+      time <- time + rec$time 
+      FN <- FN + rec$FN
+      FP <- FP + rec$FP
+    }
+  }
+  return(list(tests=tests,time=time,FN=FN,FP=FP))
+}
+
+```
+
+#### Simulation
+
+We now construct a function that simulates the splitting algorithm over a large number $N$ of randomly-generated samples $x$ of size $n$ given the sensitivity $q$ and specificity $r$ for different values of the number of splits $d$ and prevalence $p$.
+
+```{r}
+splitting.sim <- function(N,n,q,r,splits,preval) {
+  prevals <- length(preval)
+  if (prevals <= 1) {varP <- list(type="frozen",expr=quote(p),value=preval)}
+  else {varP <- list(type="grid",expr=quote(p),value=preval)}
+  varList <- varlist(
+    n.sim = list(type="N", expr=quote(N[sim]), value=N),
+    n = list(type="frozen", expr=quote(n), value=n),
+    q = list(type="frozen", expr=quote(q), value=q), 
+    r = list(type="frozen", expr=quote(r), value=r),
+    p = varP,
+    d = list(type="grid", expr=quote(d), value=splits)
+    )
+  doOne <- function(n,d,p,q,r) {
+    x <- rbinom(n,1,p)
+    one <- splitting.test(x,d,q,r)
+    c(one$time,one$cost,one$TNR,one$TPR)
+  }
+  sim <- doLapply(varList, doOne=doOne, seed="seq")
+  getArray(sim)
+}
+
+```
+
+#### Optimization
+
+Using the above function, we can now simulate the splitting algorithm for different number of splits $d$ and prevalence rates $p$ over samples of size $n=1000$ in the noiseless setting. Using these data and by setting the cost weight $w_C$ to $1$ and other weights to $0$, we obtain the cost-optimal number of splits $d$ of the splitting algorithm and its associated cost and time for various prevalence rates ranging from $0.01\%$ to $20\%$.
+
+```{r}
+q.perf <- function(k){1} # Perfect sensitivity
+r.perf <- 1              # Perfect specificity
+splits <- 1:12           # Number of splits d to test
+splittingArray <- splitting.sim(N,n,q.perf,r.perf,splits,preval)
+splitting <- algorithm.optimal(splittingArray,splits,preval,wT,wC,wN,wP)
+
+ggplot(data.frame(x=preval,y=splitting$optParameters)) + geom_point(aes(x,y),colour="blue") + ggtitle("Cost-optimal number of splits of the splitting algorithm\nn = 1000 (Noiseless)") + labs(colour = "Legend",y="Cost-optimal number of splits",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_y_continuous(breaks=splits) 
+
+naiveCurve <- function(x) 1
+ggplot(data.frame(x=preval,y=splitting$optCosts)) + geom_point(aes(x,y,colour="Simulation")) + geom_function(fun=naiveCurve, aes(x,y,colour="Naïve")) + ggtitle("Optimal relative cost of the splitting algorithm\nn = 1000 (Noiseless)") + labs(colour = "Legend",y="Optimal relative cost",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_y_continuous(breaks=seq(0,1,0.1)) + scale_color_manual("Data",values= c("gray","blue"))  
+
+ggplot(data.frame(x=preval,y=splitting$optTimes)) + geom_point(aes(x,y,colour="Simulation")) + geom_function(fun=naiveCurve, aes(x,y,colour="Naive"))+ ggtitle("Cost-optimal relative time of the splitting algorithm\nn = 1000 (Noiseless)") + labs(colour = "Legend",y="Average number of rounds",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_color_manual("Data",values= c("gray","blue")) + scale_x_continuous(breaks=seq(0,0.2,0.05))
+```
+
+In the noiseless setting, the cost-optimal number of splits decreases as the prevalence rate increases. In the noisy setting however, the cost-optimal number of splits $d_opt$ is $2$ for any prevalence rate $p$. This property is caused (quite perversely) by the fact that fewer splits lead to greater pool sizes, which in turn decrease the sensitivity, thus creating more false negative results and so decreasing the total number of tests. Choosing the number of splits $d=2$ amounts to sacrificing sensitivity and time for cost savings. This phenomenon however goes against the very purpose of group-testing; reliably identifying infected individuals.
+
+#### Analysis
+
+We may visualize as a 3D surface the relative cost and time, as well as the true negative and positive rates of the splitting algorithm as a function of the number of splits $d$ for a sample of size $n=1000$ with different values of the prevalence rate $p$ ranging from $0.01\%$ to $20\%$ in the noisy setting.
+
+```{r}
+splittingArray <- splitting.sim(N,n,q,r,splits,preval)
+splitting <- algorithm.optimal(splittingArray,splits,preval,wT,wC,wN,wP)
+
+Cost <- as.matrix(splitting$avgCosts)
+plot_ly(z =~Cost,x=~splits,y=~preval) %>% add_surface() %>% layout(
+  title="Relative cost of the splitting algorithm\nn = 1000 (Noisy)",
+  scene = list(
+    xaxis = list(title="Number of splits"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "Relative cost")
+  )
+)
+
+Time <- as.matrix(splitting$avgTimes)
+plot_ly(z =~Time,x=~splits,y=~preval) %>% add_surface() %>% layout(
+  title="Relative time of the splitting algorithm\nn = 1000 (Noisy)",
+  scene = list(
+    xaxis = list(title="Number of splits"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "Number of rounds")
+  )
+)
+
+TNR <- as.matrix(splitting$avgTNR)
+TNR <- TNR/r
+plot_ly(z =~TNR,x=~splits,y=~preval) %>% add_surface() %>% layout(
+  title="Relative true negative rate of the splitting algorithm\nn = 1000 (Noisy)",
+  scene = list(
+    xaxis = list(title="Number of splits"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "True negative rate")
+  )
+)
+
+TPR <- as.matrix(splitting$avgTPR)
+TPR <- TPR/q(1)
+plot_ly(z =~TPR,x=~splits,y=~preval) %>% add_surface() %>% layout(
+  title="Relative true positive rate of the splitting algorithm\nn = 1000 (Noisy)",
+  scene = list(
+    xaxis = list(title="Number of splits"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "True positive rate")
+  )
+)
+
+```
+
+From these surfaces, we can observe the considerable strength, but also the major weaknesses of the splitting algorithm. The cost savings produced by this approach are huge if we choose the number of splits to be $2$, even for higher prevalence rates. Moreover, the true negative rate is near perfect for any number of splits $d$, as a healthy patient has to be tested positive $log_d(n)+1$ times to be mislabeled as infected.
+
+However, these clear benefits are obtained by sacrificing other aspects of the procedure. As the number of splits is decreased and the prevalence increases, the average number of rounds required grows rapidly and may even be tripled with regards to the naive approach, making the splitting algorithm an unpractical procedure. It is to be noted that infected patients do not receive their diagnostic until the very last round. This means that patients who are the most likely to spread the virus are the last ones to receive a result.
+
+Finally, the true positive rate of the splitting algorithm is abysmal, especially for smaller number of splits $d$. Indeed, only about $1$ in $10$ infected patients are detected when using the cost-optimal $d=2$. This effect is caused by the larger pool sizes formed in the initial stages of the procedure, which yield important sample dilution and so false negatives. Such loss of sensitivity, coupled with unpractical time requirements, makes the splitting algorithm a poor choice of procedure in most cases.
+
+## Semi-adaptive algorithms
+
+Semi-adaptive algorithms are $2$-rounds hybrids between adaptive and non-adaptive algorithms. In the first round, pre-determined pooled tests are performed simultaneously on the random sample. From the results obtained, potentially infected patients are identified within reasonable certainty. In the second round, these potentially infected patients are tested individually and labeled according to the individual tests. Semi-adaptive procedures differ in the simultaneous pooled tests they perform initially, as well as the selection process from which they identify the set of potentially infected patients.
+
+In this section, we will simulate two semi-adaptive algorithms: the matrix and the hypercube algorithms.
+
+### Matrix algorithm
+
+The square matrix algorithm is a semi-adaptive algorithm in which we map the sample of $n=k^2$ individuals to the entries of a $k \times k$ matrix [@Matrix]. In the first round, we perform a pooled test on each column and each row of the square matrix. Individuals present in the intersection of two positive pools are considered potentially infected, while others are labeled as healthy. We then perform a second round of individual tests on potentially infected patients.
+
+We construct a function that simulates the matrix algorithm and computes the relative cost and time of the procedure, as well as the accuracy of the diagnostic for a given sample $x=(x_1,\ldots, x_{k^2})$ with matrix size $k$, sensitivity $q$ and specificity $r$.
+
+```{r}
+matrix.test <- function(x,k,q,r) {
+  n <- length(x)
+  # Build a (k*k)-dimensional matrix 
+  if (k == 1 | k >= n) {
+    h <- naive.test(x,q,r)
+    return(list(tests=h$tests,cost=h$cost,time=h$time,TNR=h$TNR,TPR=h$TPR))
+  }
+  dim(x) <- c(k,k)
+  y <- array(0,c(k,k))  
+  time <- 1
+  tests <- 2*k
+  Tneg <- rbinom(2*k,1,r)
+  # First round of slice tests: find all potentially infected subjects 
+  for (i in 1:k) {
+    # Generate false negatives/positives in slice tests
+    pool <- x[i,] # Row test
+    infected <- sum(pool)
+    if (infected == 0) {infected <- 1-Tneg[i]}
+    else {
+      Tpos <- rbinom(1,1,q((k/infected)))
+      infected <- infected/infected*Tpos
+    }
+    y[i,] <- y[i,] + infected
+    pool <- x[,i] # Column test
+    infected <- sum(pool)
+    if (infected == 0) {infected <- 1-Tneg[i+k]}
+    else {
+      Tpos <- rbinom(1,1,q((k/infected)))
+      infected <- infected/infected*Tpos
+    }
+    y[,i] <- y[,i] + infected
+  }
+  # Patients in intersection of positive pools are potentially infected
+  healthy <- which(y != 2)
+  infected <- which(y == 2)
+  y[healthy] <- 0
+  y[infected] <- 1
+  FN <- sum(x[healthy] > y[healthy])
+  FP <- 0
+  if (length(infected) <= 2) {
+    FP <- sum(x[infected] < y[infected])
+  }
+  # If there are more than two potentially infected subjects, retest them
+  else {
+    rest <- naive.test(x[infected],q,r)
+    tests <- tests + length(infected)
+    time <- time + length(infected)/n
+    FN <- FN + rest$FN
+    FP <- rest$FP 
+  }
+  if (sum(x) == 0) {TPR <- 1}
+  else {TPR <- 1-FN/(sum(x))}
+  if (sum(x) == n) {TNR <- 1}
+  else {TNR <- 1-FP/(sum(x==0))}
+  return(list(tests=tests,time=time,cost=tests/n,TNR=TNR,TPR=TPR))
+}
+
+```
+
+#### Simulation
+
+Using the **simsalapar** package, we now construct a function that simulates the matrix algorithm over a large number $N$ of randomly-generated samples $x$ of size $k^2$ given the sensitivity $q$ and specificity $r$ for different values of the matrix size $k$ and prevalence $p$.
+
+```{r}
+matrix.sim <- function(N,q,r,size,preval) {
+  prevals <- length(preval)
+  if (prevals <= 1) {varP <- list(type="frozen",expr=quote(p),value=preval)}
+  else {varP <- list(type="grid", expr=quote(p), value=preval)}
+  varList <- varlist(
+    n.sim = list(type="N", expr=quote(N[sim]), value=N),
+    q = list(type="frozen", expr=quote(q), value=q), 
+    r = list(type="frozen", expr=quote(r), value=r),
+    p = varP,
+    k = list(type="grid", expr=quote(k), value=size)
+    )
+  doOne <- function(k,p,q,r) {
+    n <- k^2                    # Sample size
+    x <- rbinom(n,1,p)          # Generate patient sample
+    one <- matrix.test(x,k,q,r) # Perform matrix algorithm
+    c(one$time,one$cost,one$TNR,one$TPR)
+  }
+  sim <- doLapply(varList, doOne=doOne, seed="seq")
+  getArray(sim)
+}
+```
+
+#### Analysis
+
+We may visualize as a 3D surface the relative cost and time, as well as the true negative and positive rates of the matrix algorithm as a function of the matrix size $k$ with different values of the prevalence rate $p$ ranging from $0.01\%$ to $20\%$ in the noisy setting.
+
+```{r}
+N <- 30      
+size <- 1:30    # Matrix sizes
+matrixArray <- matrix.sim(N,q,r,size,preval)
+matrix <- algorithm.optimal(matrixArray,size,preval,wT,wC,wN,wP) 
+
+Cost <- as.matrix(matrix$avgCosts)
+plot_ly(z =~Cost,x=~size,y=~preval) %>% add_surface() %>% layout(
+  title="Relative cost of the matrix algorithm\n(Noisy)",
+  scene = list(
+    xaxis = list(title = "Matrix size"),
+    yaxis = list(title="Prevalence rate"),
+    zaxis = list(title = "Relative cost")
+  )
+)
+
+Time <- as.matrix(matrix$avgTimes)
+plot_ly(z =~Time,x=~size,y=~preval) %>% add_surface() %>% layout(
+  title="Average number of rounds of the matrix algorithm\n(Noisy)",
+  scene = list(
+    xaxis = list(title = "Matrix size"),
+    yaxis = list(title= "Prevalence rate"),
+    zaxis = list(title = "Number of rounds")
+  )
+)
+
+TNR <- as.matrix(matrix$avgTNR)
+plot_ly(z =~TNR,x=~size,y=~preval) %>% add_surface() %>% layout(
+  title="True negative rate of the matrix algorithm\n(Noisy)",
+  scene = list(
+    xaxis = list(title = "Matrix size"),
+    yaxis = list(title="Prevalence rate"),
+    zaxis = list(title = "True negative rate")
+  )
+)
+
+TPR <- as.matrix(matrix$avgTPR)
+plot_ly(z =~TPR,x=~size,y=~preval) %>% add_surface() %>% layout(
+  title="True positive rate of the matrix algorithm\n(Noisy)",
+  scene = list(
+    xaxis = list(title = "Matrix size"),
+    yaxis = list(title="Prevalence rate"),
+    zaxis = list(title = "True positive rate")
+  )
+)
+
+```
+
+From the above surfaces, we can observe the strengths and weaknesses of the matrix algorithm. The cost savings produced by this approach are significant, especially when a large matrix size is chosen. The average number of rounds does not exceed $1.6$, which makes the matrix algorithm a reasonably practical procedure. Like all other adaptive procedures, the true negative rate is increased with regards to the naive approach, as a healthy patient must be in two or three positive pools to be labeled as infected. The major weakness of this algorithm is the considerable decrease in the true positive rate, which reaches a plateau at about $50\%$ for most matrix sizes $k$ and prevalences $p$. This flaw makes the matrix algorithm generally unviable in practice.
+
+However, an interesting singularity occurs when a matrix of size $k = 2$ is used. In this case, the true positive rate is significantly improved over the naive approach in exchange for a negligible increase in relative cost and time. We can visualize this trade-off below by isolating the data pertaining to this matrix size.
+
+```{r}
+N <- 5000
+size <- 1:2
+smallMatrix <- matrix.sim(N,q,r,size,preval)
+avgs <- apply(smallMatrix,1:3,mean)[,,2]
+smallCost <- as.vector(avgs[1,])
+smallTime <- as.vector(avgs[2,])
+smallTPR <- as.vector(avgs[4,])
+
+ggplot(data.frame(x=preval,y=smallTPR)) + geom_point(aes(x,y,colour="Simulation"))  + geom_hline(aes(colour="Individual sensitivity",yintercept=q(1))) +  ggtitle("True positive rate of the matrix algorithm\nk=2 (Noisy)") + labs(colour = "Legend",y="True positive rate",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_color_manual("Data",values= c("gray","blue")) + scale_x_continuous(breaks=seq(0,0.2,0.05))
+
+ggplot(data.frame(x=preval,y=smallCost)) + geom_point(aes(x,y,colour="Simulation"))  + geom_hline(aes(colour="Individual testing",yintercept=1)) +  ggtitle("Relative cost of the matrix algorithm\nk=2 (Noisy)") + labs(colour = "Legend",y="Relative cost",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_color_manual("Data",values= c("gray","blue")) + scale_x_continuous(breaks=seq(0,0.2,0.05))
+
+ggplot(data.frame(x=preval,y=smallTime)) + geom_point(aes(x,y,colour="Simulation"))  + geom_hline(aes(colour="Individual testing",yintercept=1)) +  ggtitle("Relative time of the matrix algorithm\nk=2 (Noisy)") + labs(colour = "Legend",y="Relative time",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_color_manual("Data",values= c("gray","blue")) + scale_x_continuous(breaks=seq(0,0.2,0.05))
+
+```
+
+A linear increase in sensitivity is gained whenever the prevalence rate is below $13\%$, while the additional cost and time caused by this approach never reaches above $1\%$. The matrix algorithm with size $k=2$ is therefore a viable, high-sensitivity alternative to the naive approach for similar costs.
+
+### Hypercube algorithm
+
+The hypercube algorithm is a semi-adaptive algorithm in which we map the sample of $n$ individuals to a set of $n$ points on a cubic lattice of dimension $d$, with $k$ points on each side [@Hypercube]. Assuming that the sample size satisfies $n=k^d$, this corresponds to the set of points $\{(s_1, \cdots, s_d) | s_i \in \{0, 1, 2\} \}$. We divide the lattice into $k$ parallel planes for each of the $d$ principal directions. For every $i \in \{0, 1, \cdots,k-1\}$, the $i$-th plane in direction $j \leq d$ forms a pool $S_i^j=\{(s_1, \cdots, s_d) | s_j=i\}$ consisting of $k^{d-1}=n/k$ individuals. The planes in the cube correspond to a pooling sequence $\{S_i^j | i \in \{0, 1, \cdots, k-1\}, j \in \{1, \cdots, d\} \}$ of $kd$ pools, on which we run a first round of simultaneous tests. In our simulations, we will use the cost-optimal value $k=3$ of the slice index. The matrix algorithm is a sub-case of the hypercube algorithm, where the dimension $d=2$ is fixed and the slice index $k$ corresponds to the matrix size.
+
+Individuals present in the intersection of $d$ positive pools are considered as potentially infected, while others are labeled as healthy. We perform a second round of individual tests on the others. This approach strengthens the effective specificity of the screening tests, because a healthy individual has to be present in all $d$ positive pools to be labeled as infected. On the other hand, this approach amplifies the false-negative errors produced by imperfect sensitivity of the pooled tests. Indeed, only one of the $d$ slice tests containing an infected subject must produce a false negative to yield a false negative diagnostic. In fact, every false negative pooled test leads $1/k$-th of the total sample to be automatically labeled as healthy.
+
+**Variant**: All individuals present in $d-1$ positive slices are labeled potentially infected. We run a second round of naive tests on these subjects. This method allows for a single false negative result to occur without hindering the sensitivity of the algorithm, in exchanged for a higher cost.
+
+We construct a function that simulates the hypercube algorithm and computes the relative cost and time of the procedure, as well as the accuracy of the diagnostic for a given sample $x=(x_1,\ldots, x_n)$ of size $n=k^d$ for some slice index $k$, dimension $d$, sensitivity $q$ and specificity $r$.
+
+```{r}
+## Naive approach: Individual tests on patients present in d positive slices
+hypercube.test <- function(x,k,d,q,r) {
+  # Build a d-dimensional grid with k slices in each dimension
+  n <- length(x)
+  if (n <= k | d == 1) {
+    h <- naive.test(x,q,r)
+    return(list(tests=h$tests,cost=h$cost,time=h$time,TNR=h$TNR,TPR=h$TPR))
+  }
+  dim <- rep(k,d)
+  cube <- array(x[1:k^d],dim) 
+  time <- 1
+  tests <- k*d
+  # Generate false negatives/positives in slice tests
+  sliceTests <- array(0, dim=c(k,d))
+  Tneg <- array(rbinom(k*d,1,r), dim=c(k,d))
+  # First round of slice tests: find all potentially infected subjects 
+  potential <- array(0,dim)  
+  for (j in 1:d) {
+    for (i in 1:k) {
+      # Generate false negatives/positives in slice tests
+      slice <- sum(asub(cube,i,j))
+      if (slice == 0) {slice <- 1-Tneg[i,j]}
+      else {
+        factor <- k^(d-1)/slice
+        Tpos <- rbinom(1,1,q((k^(d-1)/slice)))
+        slice <- slice/slice*Tpos
+      }
+      if (slice == 1) {
+        # Increment slice of potential array for entries that were not already counted
+        ones <- slice.index(potential,MARGIN=j) 
+        ones[which(ones != i)] <- 0
+        potential <- potential + ones/i
+        sliceTests[i,j] <- 1
+      }
+    }
+  }
+  # Subjects in d positive pools are potentially infected, naive approach on them
+  healthy <- which(potential < d)
+  infected <- which(potential == d)
+  potential[healthy] <- 0
+  potential[infected] <- 1
+  FN <- sum(cube[healthy] > potential[healthy]) 
+  FP <- 0
+  if (length(infected) <= 2) {
+    FP <- sum(cube[infected] < potential[infected])
+  }
+  else {
+    rest <- naive.test(x[infected],q,r)
+    tests <- tests + length(infected)
+    time <- time + length(infected)/n
+    FN <- FN + rest$FN
+    FP <- rest$FP 
+  }
+  if (sum(x) == 0) {TPR <- 1}
+  else {TPR <- 1-FN/(sum(x))}
+  if (sum(x) == n) {TNR <- 1}
+  else {TNR <- 1-FP/(sum(x==0))}
+  return(list(tests=tests,time=time,cost=tests/n,TNR=TNR,TPR=TPR))
+}
+```
+
+#### Simulation
+
+We now construct a function that simulates the hypercube algorithm over a large number $N$ of randomly-generated $Binomial(n,p)$ samples given the prevalence $p$, sample size $n$, sensitivity $q(k)$ in relation to the pool sizes $3^{d-1}$ and specificity $r$ for different values of the dimension $d$ and number of slices $k$.
+
+```{r}
+hypercube.sim <- function(N,k,q,r,dims,preval) {
+  if (length(preval) <= 1) {varP <- list(type="frozen", expr=quote(p), value=preval)}
+  else {varP <- list(type="grid", expr=quote(p), value=preval)}
+  varList <- varlist(
+    n.sim = list(type="N", expr=quote(N[sim]), value=N),
+    k = list(type="frozen", expr=quote(k), value=k),
+    q = list(type="frozen", expr=quote(q), value=q), 
+    r = list(type="frozen", expr=quote(r), value=r),
+    p = varP,
+    d = list(type="grid", expr=quote(d), value=dims)
+    )
+  doOne <- function(k,d,p,q,r) {
+    n <- k^d                         # Sample size
+    x <- rbinom(n,1,p)               # Generate patient sample
+    one <- hypercube.test(x,k,d,q,r) # Perform hypercube algorithm
+    c(one$time,one$cost,one$TNR,one$TPR)
+  }
+  sim <- doLapply(varList, doOne=doOne, seed="seq")
+  getArray(sim)
+}
+
+```
+
+#### Optimization
+
+We can now simulate the hypercube algorithm for different dimensions $d$ and prevalence rates $p$ for a fixed number of slices $k=3$ assuming perfect accuracy of tests. Using the simulation data and by setting the cost importance $w_C$ to $1$ and all other weights to $0$, we obtain the cost-optimal dimension $d$ of the hypercube algorithm and its associated cost and time for different prevalence rates ranging from $0.01\%$ to $20\%$ .
+
+```{r}
+N <- 30
+k <- 3       # Slice index
+dims <- 1:8  # Dimensions to test
+hypercubeArray <- hypercube.sim(N,k,q.perf,r.perf,dims,preval)
+hypercube <- algorithm.optimal(hypercubeArray,dims,preval,wT,wC,wN,wP)
+
+ggplot(data.frame(x=preval,y=hypercube$optParameters)) + geom_point(aes(x,y),colour="blue") + ggtitle("Cost-optimal dimension of the hypercube algorithm\n(Noiseless)") + labs(colour = "Legend",y="Cost-optimal dimension",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_x_continuous(breaks=seq(0,0.2,0.02)) + scale_y_continuous(breaks=dims)
+
+naiveCurve <- function(x) 1
+ggplot(data.frame(x=preval,y=hypercube$optCosts)) + geom_point(aes(x,y,colour="Simulation")) + geom_function(fun=naiveCurve, aes(x,y,colour="Naïve")) + ggtitle("Optimal relative cost of the hypercube algorithm\n(Noiseless)") + labs(colour = "Legend",y="Optimal relative cost",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_y_continuous(breaks=seq(0,1,0.1)) + scale_color_manual("Data",values= c("gray","blue")) + scale_x_continuous(breaks=seq(0,0.2,0.02))
+
+ggplot(data.frame(x=preval,y=hypercube$optTimes)) + geom_point(aes(x,y,colour="Simulation")) + geom_function(fun=naiveCurve, aes(x,y,colour="Naive"))+ ggtitle("Cost-optimal time of the hypercube algorithm\n(Noiseless)") + labs(colour = "Legend",y="Average number of rounds",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_color_manual("Data",values= c("gray","blue")) + scale_x_continuous(breaks=seq(0,0.2,0.02))
+
+```
+
+#### Analysis
+
+We may also visualize as a 3-D surface the relative cost, the number of rounds, as well as the relative true negative and positive rates of the matrix algorithm for every combination of the matrix size $k$ and prevalence $p$ for a sample of size $n=1000$ in the noisy setting.
+
+```{r}
+hypercubeArray <- hypercube.sim(N,k,q,r,dims,preval)
+hypercube <- algorithm.optimal(hypercubeArray,dims,preval,wT,wC,wN,wP)
+
+Cost <- as.matrix(hypercube$avgCosts)
+plot_ly(z =~Cost,x=~dims,y=~preval) %>% add_surface() %>% layout(
+  title="Relative cost of the hypercube algorithmn\n(Noisy)",
+  scene = list(
+    xaxis = list(title="Dimension"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "Relative cost")
+  )
+)
+
+Time <- as.matrix(hypercube$avgTimes)
+plot_ly(z =~Time,x=~dims,y=~preval) %>% add_surface() %>% layout(
+  title="Average number of rounds of the hypercube algorithm\n(Noisy)",
+  scene = list(
+    xaxis = list(title="Dimension"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "Number of rounds")
+  )
+)
+
+TNR <- as.matrix(hypercube$avgTNR)
+TNR <- TNR/r
+plot_ly(z =~TNR,x=~dims,y=~preval) %>% add_surface() %>% layout(
+  title="Relative true negative rate of the hypercube algorithmn\n(Noisy)",
+  scene = list(
+    xaxis = list(title="Dimension"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "Relative true negative rate")
+  )
+)
+
+TPR <- as.matrix(hypercube$avgTPR)
+TPR <- TPR/q(1)
+plot_ly(z =~TPR,x=~dims,y=~preval) %>% add_surface() %>% layout(
+  title="Relative true positive rate of the hypercube algorithm\n(Noisy)",
+  scene = list(
+    xaxis = list(title="Dimension"),
+    yaxis = list(title = "Prevalence rate"),
+    zaxis = list(title = "True positive rate")
+  )
+)
+
+```
+
+From the above surfaces, we can observe the strengths and weaknesses of the hypercube algorithm. The cost savings produced by this approach are important when the dimension $d$ is large. The average number of rounds does not exceed $1.4$, which makes the hypercube algorithm a practical procedure. Like all other adaptive procedures, the true negative rate is increased with regards to the naive approach, as a healthy patient must be in three positive pools to be labeled as infected. Only at dimension $d=2$ does the true negative rate drop by $1\%$ with regards to the naive approach.
+
+The major weakness of this algorithm is the sharp decrease in the true positive rate as the dimension increases. This phenomenon is caused by the increasing probability of having at least one false negative pooled test for any given infected patient. A solution to this loss of sensitivity is to use another approach in the way we identify potentially infected subjects, and to restrain our applications to low dimensions $d$.
+
+## Non-adaptive algorithms
+
+Non-adaptive algorithms perform pre-determined pooled tests and infected subjects are then directly identified on the basis of the results of these parallel pooled tests [@NonAdaptive]. Such procedures require a single round of tests, and have a fixed relative cost as the pools are chosen in advance. The major practical advantage of non-adaptive over adaptive procedures is that they are less time-consuming, as no additional time is spent waiting for the results of previous rounds. Moreover, adaptive procedures generally do not investigate further pools with negative results, meaning that infected individuals are more likely to be misdiagnosed as healthy. In contrast, non-adaptive procedures may use overlapping pooled tests, thus reducing the risk of undetected infected patients.
+
+Every non-adaptive group testing algorithm consists of two parts:
+
+1.  **Encoding**: We encode the pooling matrix $M$ of dimension $t\times n$, where $t$ is the number of pooled tests and $n$ is the size of the sample $x$. The entry at row $i$ and column $j$ is equal to $1$ if individual $i$ is present in the pool $j$, and $0$ otherwise. The matrix $M$ uniquely specifies the pools used by the algorithm. For example, the naive approach corresponds to the $n \by n$ diagonal matrix.
+
+2.  **Decoding**: Using the results of the pooled tests stored in the vector $y$ of length $t$, we infer the location of infected individuals within the estimate vector $\hat{x}$.
+
+A common characteristic of non-adaptive pooling matrices is that every patient is generally present in multiple pools. Such overlap allows for the isolation of infected patients during the decoding phase, effectively bypassing the need for a second round of narrower tests (as in adaptive algorithms). To identify the infected patient(s) within a positive pool, we use the result of the overlapping pools. For example, if a single patient is present in only positive overlapping pools, whereas all others belong to negative overlapping pools, then this person will likely be labeled as infected.
+
+### Matrix encoding
+
+The pooling design used in the encoding part of a non-adaptive algorithm has great incidence on the detection capacity of the decoding phase. We now explore different ways of constructing the pooling matrix, $M$, to compare their respective performance.
+
+#### Uniformized random pooling design
+
+In the uniformized random pooling design, the pooling matrix $M$ generated with fixed number of patients $n$ and number of tests $t$ possesses two properties [@UniformDesign]. First, all pools have equal size $g$. Second, the number of distinct pools to which each individual belongs, also called *overlap*, is uniformized among all patients. Uniformization ensures that all patients are tested in a homogeneous and equal way, as they are all present in approximately $\dfrac{t\cdot g}{n}$ distinct pools of size $g$. This design is called *doubly regular* because all row and column sums of $M$ are constant. Another benefit of this design is the equal repartition of the biological material in assays, allowing for practical consistency.
+
+The choice of pool size $g$ has considerable impact on the information gained by such design. If the pool size is too small, the amount of overlapping pools for each patient is reduced (and some might not be tested even once). On the other hand, if the pool size is too large, then less pools will test negative. In both cases, the amount of overlap between positive and negative pools is decreased. This prevents the decoding algorithm from using information transfers between pools to narrow down the set of potentially infected patients.
+
+We must therefore find the pool size that maximizes the information gained on the original sample of patients. The lower the prevalence, the greater the pool size must be in order to efficiently weed out infected patients. For any pool $i$ composed of $s_i$ individuals with known prevalence rate $p$, the event that a person in the pool is infected is a Bernoulli$(p)$ random variable. We will assume for simplicity that the sensitivity $q$ and specificity $r$ are fixed values for any pooled test. It follows that the event that the pooled test has a positive result, denoted here by $Y_i$, is a Bernoulli random variable with parameter $$X=\Big( q\cdot(1-(1-p)^{s_i})+(1-r)\cdot(1-p)^{s_i}\Big).$$ We would like to determine the pool size $s_i$ which optimizes the amount of information gained on the patient sample by the pooled test. In other terms, the optimal pool size $s_i$ must maximize the entropy of the random variable $Y_i$, which is given by $$H(Y_i;s_i)=-(1-X)\cdot log(1-X)+Xlog(X).$$We know that $$ \text{arg}\,\max\limits_{X} H(Y_i;s_i)=\dfrac{1}{2}.$$ Moreover, $$X=1/2 \iff 1/2=q\cdot(1-(1-p)^{s_i})+(1-r)\cdot(1-p)^{s_i} \iff \dfrac{1/2-q}{1-q-r}=(1-p)^{s_i}.$$ It follows that $$\text{arg}\,\max\limits_{s_i} H(Y_i;s_i)=\dfrac{ln \Big(\dfrac{1/2-q}{1-q-r}\Big)}{ln(1-\hat{p})}.$$
+
+We can compare these theoretical optimal values with several observed optimal values for Bayesian testing to find that the above is a good approximation of the real optimal pool size, although in all cases the theoretical is greater than the observed value. We must find a better estimation. Other solution: fit a curve on the observed data, and use this curve as the optimal pool size.
+
+```{r}
+# Values of observed optimal pool size for various sample sizes & prevalence
+ps <- c(0.02,0.03,0.05,0.07,0.1,0.15)
+Bayesian.250 <- c(22,16,10,6,2,2)
+Bayesian.200 <- c(20,8,8,2,2,2)
+Bayesian.150 <- c(18,14,8,6,2,2)
+Bayesian.125 <- c(11,11,7,2,2,2)
+Bayesian.100 <- c(18,10,10,2,2,2) 
+Bayesian.75 <- c(13,9,7,2,2,2)
+Bayesian.50 <- c(12,8,8,2,2,2) 
+Bayesian.30 <- c(10,10,6,2,2,2)
+
+# Theoretical value, with an approximate trend line (half of theoretical value)
+theoretical <- function(p) {floor(log((0.5-q(1))/(1-q(1)-r))/log(1-p))}
+fit <- function(p) {floor(0.5*log((0.5-q(1))/(1-q(1)-r))/log(1-p))}
+
+ggplot(data.frame(x=ps,y=Bayesian.250)) + geom_point(aes(x=x,y=y,colour="Bayesian n=250")) + geom_point(aes(x=ps,y=Bayesian.200,color="Bayesian n = 200")) + geom_point(aes(x=ps,y=Bayesian.150,color="Bayesian n = 150")) + geom_point(aes(x=ps,y=Bayesian.125,color="Bayesian n = 125")) + geom_point(aes(x=ps,y=Bayesian.100,color="Bayesian n = 100")) + geom_point(aes(x=ps,y=Bayesian.75,color="Bayesian n = 75")) + geom_point(aes(x=ps,y=Bayesian.50,color="Bayesian n = 50")) + geom_point(aes(x=ps,y=Bayesian.30,color="Bayesian n = 30")) + geom_function(fun=theoretical, aes(x,y,colour="Theoretical")) + geom_function(fun=fit, aes(x,y,colour="Trend line")) + ggtitle("Sensitivity-optimal pool size for Bayesian testing") + labs(colour = "Legend",y="Pool size",x="Prevalence") + theme(plot.title=element_text(hjust=0.5)) + scale_color_manual("Data",values= c("#99ffcc","#99ffcc","#0099ff","#0033cc","#99ff66","#99ff66","#99ff99","#000099","red","orange"))
+
+```
+
+Using the above optimal pool size, we can generate a uniformized random pooling matrix $M$ given the number of patients $n$, the number of tests $t$ and the estimated prevalence $\hat{p}$.
+
+```{r}
+uniformRandom <- function(n,t,p.estim) {
+  # Initialize the matrix M with correct row sums
+  g <- floor(0.5*log((0.5-q(1))/(1-q(1)-r))/log(1-p.estim)) # Optimal pool size
+  M <- matrix(0,nrow=t,ncol=n)
+  for (i in 1:t) {
+    pool <- sample((1:n),g)
+    M[i,pool] <- 1
+  }
+  # Swap from columns with excess to columns without until evenly distributed
+  sumcol <- apply(M,2,sum)
+  spread <- max(sumcol)-min(sumcol)
+  while(spread > 1){
+    maxCol <- which.max(sumcol) # Patient with highest number of pools
+    minCol <- which.min(sumcol) # Patient with lowest number of pools
+    swapable <- which(M[,maxCol]==1 & M[,minCol]==0) # Swapable pools
+    randIdx <- sample(swapable,1) # Pick a random swapable pools
+    M[randIdx,maxCol] <- 0 # Swap from max column to min column
+    M[randIdx,minCol] <- 1
+    sumcol <- apply(M,2,sum) 
+    spread <- max(sumcol)-min(sumcol)
+  }
+  M
+}
+
+```
+
+#### Reed-Solomon pooling design
+
+A second pooling design originates from the idea of Reed-Solomon error-correcting codes [@ReedSolomon]. This design constructs a doubly regular pooling matrix $M$ using $m$ layers, each composed of $q$ pools. In total, $t=qm$ pooled tests are therefore performed. In every layer, each of the $n$ patients is present in a single pool, and so every individual is present in exactly $m$ distinct pools of average size $n/q$. We will label the layers by $0,\ldots,m-1$ and the pools in each layer by $0,\ldots,q-1$.
+
+Although the matrix $M$ is doubly-regular as in the uniformized random design, its construction is everything but random. Each patient is represented as a polynomial $P_i$ of degree $k-1$, where $k = \lceil log_qn\rceil$. The coefficients of the polynomial correspond to the patient index $0≤i≤n-1$ converted to base $q$. For example, for $q = 5$ and $k=3$, patient $i=63$ will correspond to the polynomial $P_{63}(x)=(2,1,3)\cdot(x^2,x,1)=2x^2+x+3.$ To find the pooling assignment of every patient $i$ in each layer $j$, we evaluate the polynomial $P_i(j) \mod q$. The result will indicate the index of the pool to which patient $i$ is assigned in each layer $j$.
+
+When tests are performed with perfect accuracy, Reed-Solomon pooling designs guaranty the detection of a certain amount of infected patients. In the case of perfect tests, the best decoding algorithm is called the **naive decoding algorithm**, which consists of identifying all patients present in a negative pool as healthy, and the rest as infected. We say that a pooling design is $d$-disjunct if for every set $S$ of $d$ patients, and every patient $i \notin S$, there exists some pool $j$ for which $S \cap j=i$. If a pooling matrix $M$ is $d$-disjunct, then it is guaranteed to identify up to $d$ infected patients using perfect tests. The Reed-Solomon pooling matrix has a disjunctness of at least $d=\lfloor (m-1)/k \rfloor$. This implies that, using $t=mq$ pooled tests, we are guaranteed to identify at least $\lfloor \dfrac{t}{q(log_qn-1)}\rfloor$ infected patients. This lower bound represents the trade-off between the relative cost of the procedure and the guarantees of detection of the algorithm; the more tests are performed, the greater the capacity to identify infected subjects.
+
+Requirements: $q$ must a prime number (to also include prime powers, we need arithmetic tables for finite fields) and $m≤q, n ≤ q^q$.
+
+```{r}
+ReedSolomon <- function(n,m,q) {
+  k <- ceiling(log(n,base=q)) # Maximal degree of polynomials
+  t <- q*m # Total number of tests performed
+  M <- matrix(0,nrow=t,ncol=n) # Initialize matrix
+  polynomials <- unname(t(expand.grid(replicate(k,(0:(q-1)),simplify=FALSE))))[,(1:n)]
+  # For each layer (0,1,...,m-1), add pools (0,1,...,q-1) using polynomials
+  for (layer in 0:(m-1)) {
+    variables <- layer^(0:(k-1))
+    evaluate <- function(coeff) {(coeff %*% variables) %% q}
+    positions <- apply(polynomials,2,evaluate)
+    start <- layer*q + 1
+    M[Pair((start+positions),1:n)] <- 1
+  }
+  M
+}
+```
+
+### Decoding algorithms
+
+Decoding algorithms infer the state of each patient using the results of the pooled tests encoded in the pooling matrix $M$. We now explore different decoding procedures and their respective accuracy (or lack thereof). This algorithm is useful when testing sensitivity is high.
+
+#### Combinatorial Basis Pursuit (CBP)
+
+The CBP decoding algorithm proceeds by elimination; all subjects present in a negative pool are considered healthy while all others are labeled as infected [@CBPandCOMP]. Each pool can be tested more than once so as to improve sensitivity.
+
+-   Parameters: $t$ number of distinct tests, $\hat{p}$ estimated prevalence (for optimal pool size encoding), $K$ **repeat parameter** (initialized as $1$ in the noiseless setting).
+
+-   Encoding: The pooling matrix $M$ is generated using matrix-generating algorithm with optimal pool size derived from $\hat{p}$.
+
+-   Decoding: Each pooled test is repeated $K$ times. We declare a pool to be positive if at least $K/2$ of the tests in that group are positive and negative otherwise. This property allows for false negative results to happen without altering the diagnostic. We use only the tests which have a negative outcome to identify all healthy subjects, and declaring all other items to be infected.
+
+-   Analysis: For perfect tests: if the number of tests $t$ is sufficiently large, each healthy subject should, with significant probability appear in at least one negative test, and hence will be correctly labeled as healthy. False positive errors occur when a healthy subject is not tested, or is hidden in positive pools by other infected subjects. In the noisy setting, an increase in the repeat parameter $K$ leads to an increase in sensitivity but a $K$-fold increase in cost. A compromise must be struck between the number of tests $tK$ and accuracy. In the noiseless setting, the CBP algorithm has perfect sensitivity but it may produce false positive errors, especially when the relative cost $t/n$ is small.
+
+```{r}
+CBP.test <- function(x,p.estim,t,q,r,K=1) {
+  # Encode the (T x N) group testing matrix
+  n <- length(x)
+  M <- uniformRandom(n,t,p.estim)
+  # Perform pooled tests (K times each)
+  diagnostic <- rep(1,n) # Initially, everyone labeled as infected
+  for (i in 1:t) {
+    pool <- which(M[i,]==1)  # Indexes of patients in pool
+    infected <- sum(x[pool]) # Number of infected patients
+    dilution <- length(pool)/infected 
+    Tpos <- rbinom(K,1,q(dilution))
+    Tneg <- rbinom(K,1,r)
+    group <- 0 # Number of positive pools
+    for (k in 1:K) {
+      # Generate false negatives/positives in each test
+      if (infected > 0) {infected <- infected/infected*Tpos[k]}
+      else {infected <- 1-Tneg[k]}
+      group <- group + infected
+    }
+    # If < K/2 tests are positive, patients in the pool are healthy
+    if (group < (K/2)) {diagnostic[pool] <- 0}
+  }
+  infected <- which(diagnostic == 1)
+  healthy <- which(diagnostic == 0)
+  FN <- sum(x[healthy] > diagnostic[healthy])
+  FP <- sum(x[infected] < diagnostic[infected])
+  if (sum(x) == 0) {TPR <- 1}
+  else {TPR <- 1-FN/(sum(x))}
+  if (sum(x) == n) {TNR <- 1}
+  else {TNR <- 1-FP/(sum(x==0))}
+  return(list(tests=t*K,time=1,cost=t*K/n,TNR=TNR,TPR=TPR))
+}
+
+CBP.sim <- function(N,n,preval,q,r,ts,K=1) {
+  varList <- varlist(
+    n.sim = list(type="N", expr=quote(N[sim]), value=N),
+    n = list(type="frozen", expr=quote(n), value=n),
+    K = list(type="frozen", expr=quote(K), value=K), 
+    q = list(type="frozen", expr=quote(q), value=q), 
+    r = list(type="frozen", expr=quote(r), value=r),
+    p = list(type="grid", expr=quote(p), value=preval),
+    t = list(type="grid", expr=quote(t), value=ts)
+    )
+  doOne <- function(n,t,p,q,r,K) {
+    x <- rbinom(n,1,p)         # Generate patient sample
+    p.estim <- prevalEstim(p) # Generate prevalence estimate
+    one <- CBP.test(x,p.estim,t,q,r,K)
+    c(one$time,one$cost,one$TNR,one$TPR)
+  }
+  sim <- doLapply(varList, doOne=doOne, seed="seq")
+  getArray(sim)
+}
+
+```
+
+##### Simulation
+
+We can visualize as a 3D-surface the true negative and positive rates of the CBP algorithm for a sample of size $n=100$ and varying values of the prevalence rate $p$ and number of distinct tests $t$ in the noisy setting with repeat parameter $K=2$.
+
+```{r}
+N <- 20            # Number of simulations
+n <- 100           # Sample size
+preval <- seq(0.01,0.1,0.01)  # Prevalence rates
+ts <- seq(5,50,5)  # Number of distinct tests
+K <- 2             # Sensitivity parameter = Number of repeated pools
+
+NoisyCBP <- CBP.sim(N,n,preval,q,r,ts,K)
+avgs <- apply(NoisyCBP,1:3,mean)
+avgTNR <- avgs[3,,]
+avgTPR <- avgs[4,,]
+
+plot_ly(z =~avgTNR,y=~preval,x=~(ts*K/n)) %>% add_surface() %>% layout(
+  title="True negative rate of the CBP algorithm\nn=100, K = 2 (Noisy)",
+  scene = list(
+    xaxis = list(title = "Relative cost"),
+    yaxis = list(title="Prevalence rate"),
+    zaxis = list(title = "True negative rate")
+  )
+)
+
+plot_ly(z =~avgTPR,y=~preval,x=~(ts*K/n)) %>% add_surface() %>% layout(
+  title="True positive rate of the CBP algorithm\nn=100, K = 2 (Noisy)",
+  scene = list(
+    xaxis = list(title = "Relative cost"),
+    yaxis = list(title="Prevalence rate"),
+    zaxis = list(title = "True positive rate")
+  )
+)
+```
+
+#### Combinatorial Orthogonal Matching Pursuit (COMP)
+
+The COMP decoding algorithm proceeds column-wise on the pooling matrix $M$, instead of row-wise as in the CBP algorithm [@CBPandCOMP]. Patients who are present in only positive pools are considered as infected; all others as healthy. In the noisy setting, we can allow for a given number of mismatches.
+
+-   Parameters: $t$ number of tests, $g$ pool size, $K$ **mismatch parameter** (initialized as $-1$ in the noiseless setting)
+
+-   Encoding: Randomized uniform pooling matrix $M$
+
+-   Decoding: Column-wise: if a column is entirely contained in the results vector $Y$, then the patient is considered infected. This is equivalent to the condition that patients present in only positive pools are labeled as infected. We can stretch this condition to allow for false negative errors as follows: for every column $j$ of $M$, let $T_j$ be the set of indexes $i$ for which $M_{i,j} = 1$, $S_j$ be the set of indexes $j$ where both $y_i = 1$ and $M_{i,j} == 1$, and $Err$ be the probability of false results. The $j$-th subject is declared to be infected if $|S_j|≥|T_j|(1-Err(1+K))$ and healthy otherwise. As the specificity $r$ of PCR tests is high, we will choose $Err$ to be the false negative rate for individual tests $1-q(1)$.
+
+-   Analysis: In the noiseless setting, only false positive errors occur, especially at low relative cost $t/n$. In the noisy setting, we relax the sharp-threshold requirement in the original COMP algorithm that the set of locations of ones in any column of M corresponding to an infected subject be entirely contained in the set of locations of ones in the result vector $y$. We therefore allow for a certain number of mismatches.
+
+```{r}
+COMP.test <- function(x,p.estim,t,q,r,K=-1) {
+  # Encode the (T x N) group testing matrix
+  n <- length(x)
+  M <- uniformRandom(n,t,p.estim)
+  # Perform the pooled tests
+  y <- numeric(t)
+  for (i in 1:t) {
+    pool <- which(M[i,]==1)
+    infected <- sum(x[pool])
+    dilution <- sum(pool)/infected
+    # Generate false negatives/positives in test
+    if (infected > 0) {
+      Tpos <- rbinom(1,1,q(dilution))
+      infected <- infected/infected*Tpos
+    }
+    else {
+      Tneg <- rbinom(1,1,r)
+      infected <- 1-Tneg
+    }
+    y[i] <- infected
+  }
+  # Identify infected subjects by columns using y
+  results <- numeric(n)
+  for (j in 1:n) {
+    pools <- which(M[,j] == 1)
+    posPools <- which(M[,j] == 1 & y == 1)
+    threshold <- length(pools)*(1-(1-q(1))*(1+K))
+    if (length(posPools) >= threshold) {results[j] <- 1} 
+  }
+  infected <- which(results == 1)
+  healthy <- which(results == 0)
+  FN <- sum(x[healthy] > results[healthy])
+  FP <- sum(x[infected] < results[infected])
+  if (sum(x) == 0) {TPR <- 1}
+  else {TPR <- 1-FN/(sum(x))}
+  if (sum(x) == n) {TNR <- 1}
+  else {TNR <- 1-FP/(sum(x==0))}
+  return(list(tests=t,time=1,cost=t/n,TNR=TNR,TPR=TPR))
+}
+
+COMP.sim <- function(N,n,preval,q,r,ts,K=-1) {
+  varList <- varlist(
+    n.sim = list(type="N", expr=quote(N[sim]), value=N),
+    n = list(type="frozen", expr=quote(n), value=n),
+    K = list(type="frozen", expr=quote(K), value=K), 
+    q = list(type="frozen", expr=quote(q), value=q), 
+    r = list(type="frozen", expr=quote(r), value=r),
+    p = list(type="grid", expr=quote(p), value=preval),
+    t = list(type="grid", expr=quote(t), value=ts)
+    )
+  doOne <- function(n,t,p,q,r,K) {
+    x <- rbinom(n,1,p)         # Generate patient sample
+    p.estim <- prevalEstim(p) # Generate prevalence estimate
+    one <- COMP.test(x,p.estim,t,q,r,K)
+    c(one$time,one$cost,one$TNR,one$TPR)
+  }
+  sim <- doLapply(varList, doOne=doOne, seed="seq")
+  getArray(sim)
+}
+```
+
+##### Simulation
+
+We first visualize as a 3D-surface the true negative and positive rates of the CBP algorithm for a sample of size $n=200$ and varying values of the prevalence rate $p$ and the number of tests $t$ in the noisy setting with mismatch parameter $K=-1$.
+
+```{r}
+N <- 20             # Number of simulations
+n <- 100            # Sample size
+preval <- seq(0.01,0.1,0.01) # Prevalence rates
+ts <- seq(10,n,10)  # Number of tests
+K <- -1             # Mismatch parameter
+
+NoisyCOMP <- COMP.sim(N,n,preval,q,r,ts,K)
+avgs <- apply(NoisyCOMP,1:3,mean)
+avgCost <- avgs[2,,]
+avgTNR <- avgs[3,,]
+avgTPR <- avgs[4,,]
+
+plot_ly(z =~avgTNR,x=~(ts/n),y=~preval) %>% add_surface() %>% layout(
+  title="True negative rate of the COMP algorithm\nn=100, K = -1 (Noisy)",
+  scene = list(
+    yaxis = list(title="Prevalence rate"),
+    xaxis = list(title = "Relative cost"),
+    zaxis = list(title = "True negative rate")
+  )
+)
+
+plot_ly(z =~avgTPR,x=~(ts/n),y=~preval) %>% add_surface() %>% layout(
+  title="True positive rate of the COMP algorithm\nn=100, K = -1 (Noisy)",
+  scene = list(
+    yaxis = list(title="Prevalence rate"),
+    xaxis = list(title = "Relative cost"),
+    zaxis = list(title = "True positive rate")
+  )
+)
+```
+
+#### Bayesian approach
+
+Bayesian inference can be used to estimate the infection probability of each patient from several pooled test results and their corresponding sensitivity and specificity [@Bayesian]. Remark that the infection probability of each patient depends on the result of the pools it belongs to, as well as the infection probability of other patients present in the same pools. The infinite depth of the resulting network of interdependence renders impossible the direct computation of individual probabilities. Instead, a **belief propagation** algorithm repetitively "adjusts" the probabilities until convergence.
+
+Let $X^{(0)} \in \{0,1\}^n$ be the **patient state vector** with $n$ patients, where $X^{(0)}_i=1$ if patient $i$ is infected and $0$ otherwise. We perform $T$ simultaneous pooled tests on the sample, yielding a fixed relative cost of $T/n$. Let $Y \in \{0,1\}^T$ be the results vector, where $Y_t = 1$ if test $t$ is positive and $0$ otherwise. Our goal is to infer the value of the unknown patient state vector $X^{(0)}$ using the **results vector** $Y$ from our knowledge of the estimated prevalence $\hat{p}$, sensitivity $q$ and specificity $r$.
+
+This inference will result in the **infection probability vector** $X \in [0,1]^n$, where $X_i$ is the estimated probability that patient $i$ is infected. Given this vector and the estimated prevalence, we will choose the patients most likely to be infected. Given the true state $X^{(0)}$, the probability distribution of the results vector $Y$ is given by $$ P(Y | X^{(0)}, q, r)= \prod^T_{t=1} P(Y_t | X^{(0)},q,r),$$ where, denoting the true state of the patients in the pool $t$ by $X_t^{(0)}$, we have $$ P(Y_t | X,q,r) = (q Y_t + (1-q)(1-Y_t)) X_t^{(0)} + ((1-r)Y_t + r(1-Y_t) )(1-X_t^{(0)}).$$Although the exact prevalence is not known, an estimate of the prevalence is generated with the ARIMAmodel within a relative error of $5\%$ in average. The prior distribution of the patient states given the estimated prevalence $\hat{p} \in [0,1]$ is $$ P_0(X | \hat{p}) = \prod^n_{i=1} \{\hat{p}X_i+(1-\hat{p})(1-X_i)\}.$$ From Bayes rule, the posterior distribution on the patient states is $$ P(X | Y) \propto P(Y | X,q,r)P_0(X|\hat{p}).$$The state of the $i$th patient is inferred from the marginal distribution $$ P(X_i | Y) = \sum_{X \setminus X_i} P(X|Y).$$ As $X_i\in \{0,1\}$, we can represent the marginal distribution as a Bernoulli($\theta_i$) random variable, i.e. $$ P(X_i | Y) = \theta_i X_i + (1-\theta_i)(1-X_i),$$ where $\theta_i$ is the infection probability $P(X_i = 1)$. A simple estimate of $X_i^{(0)}$ is found using the estimator $$X_i^{(0)} = 1(\theta_i > 0.4).$$
+
+Determining the marginal distributions requires an exponentially large number of computations. We will therefore use a **Belief Propagation** (BP) algorithm to approximate the marginal distributions within an reasonably small error.
+
+Let $M(t)$ denote the indices of the patients in the pool $t$ and $G(i)$ be the indices of the pools in which patient $i$ is included. The marginal distribution of any individual is interdependent on those of other individuals in the same pools, which in turn depend on other distributions. This interdependence can be modeled as back and forth information transfers between tests and individuals. For any individual $i$ in any pool $t$, we define the **forward information** as $$ \tilde{m}_{t \rightarrow i} (X_i) \propto \sum_{X \setminus X_i} P(Y_t | X,q,r) \prod_{j \in M(t)\setminus i} m_{j \rightarrow t}(X_i),$$ and the **backward information** as $$ m_{i \rightarrow t}(X_i) \propto P_0(X_i | \hat{p}) \prod_{s \in G(i)\setminus t} \tilde{m}_{s \rightarrow i} (X_i).$$Intuitively, the backward information $m_{i \rightarrow t}(X_i)$ and the forward information $\tilde{m}_{t \rightarrow i}(X_i)$ respectively represent the marginal distribution of $X_i$ before and after the pooled test $t$ is performed. Since $X_i \in \{0,1\}$, these variables can be represented by a single parameter as $$ \tilde{m}_{t \rightarrow i}(X_i) = \tilde{\theta}_{t \rightarrow i} X_i + (1-\tilde{\theta}_{t \rightarrow i})(1-X_i),$$ $$ m_{i \rightarrow t}(X_i) = \theta_{i \rightarrow t}X_i + (1-\theta_{i \rightarrow t})(1-X_i),$$ where the parameters $\tilde{\theta}_{t \rightarrow i}$ and $\theta_{i \rightarrow t}$ are given by $$ \tilde{\theta}_{t \rightarrow i} = \dfrac{U_t}{\tilde{Z}_{t \rightarrow i}},$$ $$ \theta_{i \rightarrow t} = \dfrac{\hat{p}\prod_{s \in G(i)\setminus t} \tilde{\theta}_{s \rightarrow i}}{Z_{i \rightarrow t}}$$ and $$ U_t = qY_t+ (1-q)(1-Y_t),$$ $$ W_t = (1-r)Y_t + r(1-Y_t),$$ $$ \tilde{Z}_{t \rightarrow i} = U_t \left( 2-\prod_{j \in M(t)\setminus i}(1-\theta_{j \rightarrow t})\right) + W_t \prod_{j \in M(t)\setminus i}(1-\theta_{j \rightarrow t}),$$ $$ Z_{i \rightarrow t} = \hat{p} \prod_{s \in G(i)\setminus t} \tilde{\theta}_{s \rightarrow i} + (1-\hat{p})  \prod_{s \in G(i)\setminus t} (1-\tilde{\theta}_{s \rightarrow i})$$ From these information variables, we can approximate the marginal distributions as $$ P(X_i) \propto \{ \hat{p}X_i + (1-\hat{p})(1-X_i)\} \prod_{t \in G(i)} \tilde{m}_{t \rightarrow i}(X_i) = \left( \hat{p} \prod_{t \in G(i)} \tilde{\theta}_{t \rightarrow i} \right)X_i + \left( (1-\hat{p})\prod_{t \in G(i)} (1-\tilde{\theta}_{t \rightarrow i}) \right)(1-X_i),$$ and so the infection probability is approximated by
+
+$$ \tilde{\theta}_i = \dfrac{\hat{p} \prod_{t \in G(i)}\tilde{\theta}_{t \rightarrow i}}{\hat{p} \prod_{t \in G(i)}\tilde{\theta}_{t \rightarrow i} + (1-\hat{p})\prod_{t \in G(i)}(1-\tilde{\theta}_{t \rightarrow i})}.$$Finally, we can pick the estimator to be $X_i= 1(\tilde{\theta_i}>0.4).$ We can add a damping factor $d \in (0,1]$ to stabilize the convergence of the algorithm as
+
+$$ \tilde{\theta}_{t \rightarrow i}^{(k)} \leftarrow d\tilde{\theta}_{t \rightarrow i}^{(k)} + (1-d)\tilde{\theta}_{t \rightarrow i}^{(k-1)},$$
+
+$$ \theta_{i \rightarrow t}^{(k)} \leftarrow d\theta_{i \rightarrow t}^{(k)} + (1-d)\theta_{i \rightarrow t}^{(k-1)}.$$ Note that a small damping factor increases the time required for convergence, but yields more accurate results.
+
+-   Parameters: $t$ number of tests, $\hat{p}$ estimated prevalence, as well as depth and damping hyperparameters.
+
+-   Encoding: We generate a uniformized random pooling matrix $M$ with $t$ pools with optimal pool size and constant overlap.
+
+-   Decoding: Using a belief propagation algorithm, we compute the posterior distribution $X$ of infected individuals and each coordinate $X_i$ is the probability that individual $i$ is infected. From there, we can choose any estimator to identify infected individuals, which has an impact on the true positive and negative rates. In our simulations, we identify all individuals with over $40\%$ probability of infection as infected.
+
+```{r}
+Bayesian.test <- function(x,t,p.estim,q,r,depth,damping=1) {
+  # ENCODING: (T x N) group testing matrix
+  n <- length(x)
+  g <- floor(0.5*log((0.5-q(1))/(1-q(1)-r))/log(1-p.estim)) # Optimal pool size
+  M <- uniformRandom(n,t,p.estim)
+  # Perform tests encoded in matrix M
+  res <- numeric(t)    # Results vector
+  for (test in 1:t) {
+    pool <- which(M[test,]==1)
+    infected <- sum(x[pool])
+    # Generate false negatives/positives in tests
+    if (infected > 0) {
+      dilution <- length(pool)/infected
+      Tpos <- rbinom(1,1,q(dilution))
+      infected <- infected/infected*Tpos
+    }
+    else {infected <- rbinom(1,1,(1-r))}
+    res[test] <- infected
+  }
+  # DECODING: Initialize parameters
+  Se <- matrix(((q(g))*res + (1-q(g))*(1-res)),nrow=t,ncol=n) # Sensitivity matrix
+  Sp <- matrix(((1-r)*res + r*(1-res)),nrow=t,ncol=n)   # Specificity matrix
+  backward <- M*runif(t*n,min=0,max=1)                # U(0,1) initially
+  forward <- M*runif(t*n,min=0,max=1)                 # U(0,1) initially
+  
+  # Update parameters for each (patient,pool) combination 'depth' times
+  for (d in 1:depth) {
+    # Save previous values of theta for convergence check
+    prev_backward <- backward 
+    prev_forward <- forward
+    
+    # Update theta.2 with damping
+    back.prod <- apply((1-backward),1,prod)
+    pools <- M*matrix(back.prod,nrow=t,ncol=n)/(1-backward)
+    Z.2 <- Se*(2-pools) + Sp*pools
+    new_forward <- M*Se/Z.2
+    forward <- damping*(new_forward)+(1-damping)*prev_forward
+    
+    # Update theta.1 with damping
+    groups <- (1-M)+forward
+    groups_prod <- apply(groups,2,prod)
+    groups_mat <- matrix(groups_prod,nrow=t,ncol=n,byrow=TRUE)/groups
+    
+    n_groups <- 1-forward
+    n_groups_prod <- apply(n_groups,2,prod)
+    n_groups_mat <- matrix(n_groups_prod,nrow=t,ncol=n,byrow=TRUE)/n_groups
+
+    Z_p.back <- p.estim*groups_mat
+    Z_n.back <- (1-p.estim)*n_groups_mat
+    new_backward <- M*Z_p.back/(Z_p.back+Z_n.back)
+    backward <- damping*new_backward + (1-damping)*prev_backward
+    
+    # Check for convergence in theta parameters
+    backward.conv <- sum(abs(backward-prev_backward) < 0.0001,na.rm=TRUE) == t*n
+    forward.conv <- sum(abs(forward-prev_forward) < 0.0001,na.rm=TRUE) == t*n
+    if (backward.conv & forward.conv) {break}
+  }
+  Z_p <- p.estim*apply(((1-M)+forward),2,prod)
+  Z_n <- (1-p.estim)*apply((1-forward),2,prod)
+  probInfect <- round(Z_p/(Z_p+Z_n),digits=5)
+  
+  # Potentially infected individuals: P(X_i = 1) > 0.5
+  infected <- which(probInfect > 0.4)
+  healthy <- which(probInfect <= 0.4)
+  diagnostic <- rep(0,n)
+  diagnostic[infected] <- 1
+  FN <- sum(x[healthy] > diagnostic[healthy])
+  FP <- sum(x[infected] < diagnostic[infected])
+  if (sum(x) == 0) {TPR <- 1}
+  else {TPR <- 1-FN/(sum(x))}
+  if (sum(x) == n) {TNR <- 1}
+  else {TNR <- 1-FP/(sum(x==0))}
+  return(list(tests=t,time=1,cost=(t/n),TNR=TNR,TPR=TPR))
+}
+
+Bayesian.sim <- function(N,n,preval,q,r,ts,depth,damping=1) {
+  varList <- varlist(
+    n.sim = list(type="N",expr=quote(N[sim]),value=N),
+    n = list(type="frozen",expr=quote(n),value=n),
+    q = list(type="frozen",expr=quote(q),value=q), 
+    r = list(type="frozen",expr=quote(r),value=r),
+    depth = list(type="frozen",expr=quote(depth),value=depth),
+    damping = list(type="frozen",expr=quote(damping),value=damping),
+    p = list(type="grid", expr=quote(p), value=preval),
+    t = list(type="grid",expr=quote(t),value=ts)
+    )
+  doOne <- function(n,t,p,q,r,depth,damping) {
+    x <- rbinom(n,1,p)         # Generate patient sample
+    p.estim <- prevalEstim(p) # Generate prevalence estimate
+    one <- Bayesian.test(x,t,p.estim,q,r,depth,damping) # Apply Bayesian algorithm 
+    c(one$time,one$cost,one$TNR,one$TPR) 
+  }
+  sim <- doLapply(varList, doOne=doOne, seed="seq")
+  getArray(sim)
+}
+
+```
+
+##### Simulation
+
+We can visualize as a 3D-surface the true negative and positive rates of the Bayesian algorithm for a sample of size $n=100$ and varying values of the number of tests $t$ and the prevalence rate $p$ in the noisy setting.
+
+```{r}
+N <- 30            # Number of simulations
+n <- 100           # Sample size
+ts <- seq(10,n,10) # Number of tests
+preval <- seq(0.01,0.1,0.01)  # Prevalence rates
+damping <- 0.5     # Damping factor of updates
+depth <- 50        # Max number of updates
+
+Bayesian <- Bayesian.sim(N,n,preval,q,r,ts,depth,damping)
+avgs <- apply(Bayesian,1:3,mean)
+avgTNR <- avgs[3,,]
+avgTPR <- avgs[4,,]
+
+plot_ly(z =~avgTNR,y=~preval,x=~ts/n) %>% add_surface() %>% layout(
+  title="True negative rate of the Bayesian algorithm\nUniformized random matrix\nn=100 (Noisy)",
+  scene = list(
+    xaxis = list(title = "Relative cost"),
+    yaxis = list(title="Prevalence rate"),
+    zaxis = list(title = "True negative rate")
+  )
+)
+
+plot_ly(z =~avgTPR,y=~preval,x=~ts/n) %>% add_surface() %>% layout(
+  title="True positive rate of the Bayesian algorithm\nUniformized random matrix\nn=100 (Noisy)",
+  scene = list(
+    xaxis = list(title = "Relative cost"),
+    yaxis = list(title="Prevalence rate"),
+    zaxis = list(title = "True positive rate")
+  )
+)
+```
+
+The above surfaces highlight the well-rounded strength of the Bayesian approach. While the true negative rate is somewhat lower than with individual testing or adaptive algorithms, the resulting true positive rate is considerable when using a medium to high relative cost. For example, for a prevalence rate of $p=5\%$, we can yield higher accuracy than with individual testing while saving about $30\%$ of tests and sacrificing only $1\%$ of true negative rate. This fact, coupled with the use of a single round of tests, makes the Bayesian algorithm the most viable group-testing procedure simulated in this project.
+
+Broadly speaking, the group-testing procedures which yield the best accuracy for a given relative cost are:
+
+-   Same cost as naive approach, high accuracy: 2-by-2 matrix algorithm
+
+-   Medium cost-savings with similar accuracy as naive approach: Bayesian algorithm
+
+-   High cost-savings with low accuracy: Dorfman's algorithm
+
+Further work on the Bayesian approach is required in order to optimize its accuracy for a given cost. A few ideas might include:
+
+-   Pooling design: find a more accurate (and non-arbitrary) representation of the optimal pool size in the uniformized random design given the number of patients, number of tests, prevalence rate, sensitivity and specificity.
+
+-   Pooling design: Simulate the Bayesian approach using the Reed-Solomon encoding by determining the optimal parameters ($q$ and $m$).
+
+-   Estimator: Find a more accurate (and non-arbitrary) way to estimate the state of each patient based on their respective infection probability. Possibly include additional naive tests on those who are in the grey zone.
+
+-   Review the literature on adaptive Bayesian algorithms, where a few rounds of tests are performed and, at each step, Bayesian decoding is used to determine the next pools to maximize the amount of information gained on the original sample [@AdaptiveBayesian2020; @AdaptiveBayesian2021].
+
+- Apply different group-testing algorithms for machine learning in order to gain efficiency on forward passes in neural networks [@NeuralGroupTesting].
+
+## Bibliography
+
+
