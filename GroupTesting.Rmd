@@ -2,13 +2,11 @@
 title: "Group testing algorithms"
 author: "Antoine Bonnet"
 date: "24/08/2021"
-output: html_document
 bibliography: references.bib 
 link_citations: true
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
 library(ggplot2)    # Plots
 library(ggrepel)    # Labeled plots
 library(plotly)     # 3D Surfaces
