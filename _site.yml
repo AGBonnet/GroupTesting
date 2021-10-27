@@ -5,7 +5,7 @@ navbar:
   left:
   - text: "Home"
    href: index.html
-  - text: "GroupTesting"
+  - text: "Group testing algorithm for COVID-19"
    href: GroupTesting.html
 output:
   html_document:
