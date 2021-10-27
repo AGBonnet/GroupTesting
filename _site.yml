@@ -1,0 +1,12 @@
+name: "GroupTesting"
+output_dir: "docs"
+navbar:
+  title: "Group testing"
+  left:
+  - text: "Home"
+   href: index.html
+  - text: "GroupTesting"
+   href: GroupTesting.html
+output:
+  html_document:
+ theme: cosmo
